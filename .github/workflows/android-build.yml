@@ -160,6 +160,15 @@ jobs:
           import android.view.accessibility.AccessibilityNodeInfo
           import java.util.concurrent.ConcurrentLinkedDeque
 
+          data class Step(
+              val x: Float,
+              val y: Float,
+              val waitMs: Long,
+              val x2: Float = -1f,
+              val y2: Float = -1f,
+              val durMs: Long = 50L
+          )
+
           class GamePlayAccessibilityService : AccessibilityService() {
 
               private val handler = Handler(Looper.getMainLooper())
@@ -232,6 +241,15 @@ jobs:
                   dispatchGesture(gesture, null, null)
               }
 
+              fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, durMs: Long) {
+                  val path = Path()
+                  path.moveTo(x1, y1)
+                  path.lineTo(x2, y2)
+                  val stroke = GestureDescription.StrokeDescription(path, 0L, durMs)
+                  val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                  dispatchGesture(gesture, null, null)
+              }
+
               fun startTapping(x: Float, y: Float, intervalMs: Long, maxTaps: Int, startDelayMs: Long) {
                   stopTapping()
                   tapsDone = 0
@@ -244,6 +262,39 @@ jobs:
                           tap(x, y)
                           tapsDone += 1
                           handler.postDelayed(this, intervalMs)
+                      }
+                  }
+                  tapRunnable = runnable
+                  handler.postDelayed(runnable, startDelayMs)
+              }
+
+              fun startSequence(steps: List<Step>, repeats: Int, startDelayMs: Long) {
+                  stopTapping()
+                  tapsDone = 0
+                  if (steps.isEmpty()) return
+                  var index = 0
+                  var round = 0
+                  val runnable = object : Runnable {
+                      override fun run() {
+                          if (round >= repeats) {
+                              tapRunnable = null
+                              return
+                          }
+                          val step = steps[index]
+                          var extra = 0L
+                          if (step.x2 >= 0f) {
+                              swipe(step.x, step.y, step.x2, step.y2, step.durMs)
+                              extra = step.durMs
+                          } else {
+                              tap(step.x, step.y)
+                          }
+                          tapsDone += 1
+                          index += 1
+                          if (index >= steps.size) {
+                              index = 0
+                              round += 1
+                          }
+                          handler.postDelayed(this, step.waitMs + extra)
                       }
                   }
                   tapRunnable = runnable
@@ -313,6 +364,8 @@ jobs:
               private lateinit var yField: EditText
               private lateinit var intervalField: EditText
               private lateinit var maxField: EditText
+              private lateinit var seqField: EditText
+              private lateinit var repeatsField: EditText
               private var showScan = false
 
               private fun input(hintText: String, value: String, number: Boolean): EditText {
@@ -410,6 +463,26 @@ jobs:
                           render()
                       }
                   })
+                  root.addView(label("3b. SECUENCIA DE TOQUES"))
+                  seqField = input("toque: x,y,espera | deslizar: x1,y1,x2,y2,dur,espera (separa con ;)", "", false)
+                  seqField.setSingleLine(false)
+                  repeatsField = input("Repeticiones (1-500)", "1", true)
+                  root.addView(seqField)
+                  root.addView(repeatsField)
+                  root.addView(button("Iniciar secuencia en 5 s") {
+                      val s = GamePlayAccessibilityService.instance
+                      val steps = parseSteps(seqField.text.toString())
+                      val repeats = (repeatsField.text.toString().toIntOrNull() ?: 1).coerceIn(1, 500)
+                      if (s == null) {
+                          Toast.makeText(this, "Activa el servicio primero", Toast.LENGTH_SHORT).show()
+                      } else if (steps == null || steps.isEmpty()) {
+                          Toast.makeText(this, "Secuencia no valida. Formato: x,y,espera;x,y,espera", Toast.LENGTH_LONG).show()
+                      } else {
+                          s.startSequence(steps, repeats, 5000L)
+                          Toast.makeText(this, "Cambia al juego, empieza en 5 s", Toast.LENGTH_LONG).show()
+                          render()
+                      }
+                  })
                   root.addView(button("PARAR toques") {
                       GamePlayAccessibilityService.instance?.stopTapping()
                       render()
@@ -440,6 +513,32 @@ jobs:
               override fun onResume() {
                   super.onResume()
                   render()
+              }
+
+              private fun parseSteps(text: String): List<Step>? {
+                  val result = mutableListOf<Step>()
+                  for (part in text.split(";")) {
+                      val p = part.trim()
+                      if (p.isEmpty()) continue
+                      val nums = p.split(",").map { it.trim() }
+                      if (nums.size == 3) {
+                          val x = nums[0].toFloatOrNull() ?: return null
+                          val y = nums[1].toFloatOrNull() ?: return null
+                          val w = nums[2].toLongOrNull() ?: return null
+                          result.add(Step(x, y, w.coerceAtLeast(300L)))
+                      } else if (nums.size == 6) {
+                          val x1 = nums[0].toFloatOrNull() ?: return null
+                          val y1 = nums[1].toFloatOrNull() ?: return null
+                          val x2 = nums[2].toFloatOrNull() ?: return null
+                          val y2 = nums[3].toFloatOrNull() ?: return null
+                          val d = nums[4].toLongOrNull() ?: return null
+                          val w = nums[5].toLongOrNull() ?: return null
+                          result.add(Step(x1, y1, w.coerceAtLeast(300L), x2, y2, d.coerceIn(100L, 10000L)))
+                      } else {
+                          return null
+                      }
+                  }
+                  return result
               }
 
               private fun render() {
