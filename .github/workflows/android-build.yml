@@ -130,7 +130,7 @@ jobs:
           cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
           <resources>
               <string name="app_name">GAME PLAY AI JR</string>
-              <string name="service_description">Registra eventos de accesibilidad para el agente de automatizaciÃ³n BETA.</string>
+              <string name="service_description">Registra eventos de accesibilidad para el agente de automatizacion BETA.</string>
           </resources>
           EOF_FILE
           mkdir -p "$(dirname app/src/main/res/xml/accessibility_service_config.xml)"
@@ -224,7 +224,7 @@ jobs:
                   }
 
                   val title = TextView(this).apply {
-                      text = "GAME PLAY AI JR â€” BETA"
+                      text = "GAME PLAY AI JR - BETA"
                       textSize = 20f
                       setTypeface(typeface, Typeface.BOLD)
                   }
@@ -253,6 +253,46 @@ jobs:
                   val scroll = ScrollView(this).apply { addView(log) }
 
                   root.addView(title)
+                  root.addView(status)
+                  root.addView(openSettings)
+                  root.addView(refresh)
+                  root.addView(stop)
+                  root.addView(scroll)
+                  setContentView(root)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  render()
+              }
+
+              private fun render() {
+                  val active = GamePlayAccessibilityService.instance != null
+                  status.text = if (active) "Servicio: ACTIVO" else "Servicio: INACTIVO"
+                  log.text = GamePlayAccessibilityService.events.joinToString("\n\n")
+              }
+          }
+          EOF_FILE
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Aceptar licencias del SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GamePlayAIJR-debug-apk
+          path: app/build/outputs/apk/debug/*.apk)
                   root.addView(status)
                   root.addView(openSettings)
                   root.addView(refresh)
