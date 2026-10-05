@@ -130,7 +130,7 @@ jobs:
           cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
           <resources>
               <string name="app_name">GAME PLAY AI JR</string>
-              <string name="service_description">Registra eventos de accesibilidad para el agente de automatizacion BETA.</string>
+              <string name="service_description">Lee la pantalla del juego elegido y realiza toques automaticos que tu configures.</string>
           </resources>
           EOF_FILE
           mkdir -p "$(dirname app/src/main/res/xml/accessibility_service_config.xml)"
@@ -141,6 +141,7 @@ jobs:
               android:accessibilityFeedbackType="feedbackGeneric"
               android:accessibilityFlags="flagDefault|flagReportViewIds"
               android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
               android:description="@string/service_description"
               android:notificationTimeout="100" />
           EOF_FILE
@@ -149,11 +150,20 @@ jobs:
           package com.jr.gameplayai
 
           import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.os.Handler
+          import android.os.Looper
           import android.util.Log
           import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
           import java.util.concurrent.ConcurrentLinkedDeque
 
           class GamePlayAccessibilityService : AccessibilityService() {
+
+              private val handler = Handler(Looper.getMainLooper())
+              private var tapRunnable: Runnable? = null
 
               override fun onServiceConnected() {
                   super.onServiceConnected()
@@ -165,21 +175,94 @@ jobs:
                   if (event == null) return
 
                   val packageName = event.packageName?.toString() ?: "desconocido"
+                  val filter = targetPackage
+                  if (filter.isNotEmpty() && packageName != filter) return
+
                   val className = event.className?.toString() ?: "desconocido"
                   val text = event.text.joinToString(separator = ", ") { it.toString() }
 
                   val line = "type=${event.eventType}, package=$packageName, class=$className, text=$text"
-                  Log.i(TAG, "Evento: $line")
-
                   events.addFirst(line)
                   while (events.size > MAX_EVENTS) events.pollLast()
               }
 
+              // ---------- Escaneo de pantalla ----------
+
+              fun scanLater(delayMs: Long) {
+                  scanResult = listOf("Escaneando en ${delayMs / 1000} s... cambia al juego ahora.")
+                  handler.postDelayed({ scanResult = scanScreen() }, delayMs)
+              }
+
+              private fun scanScreen(): List<String> {
+                  val root = rootInActiveWindow
+                      ?: return listOf("Sin ventana activa o la app bloquea la lectura.")
+                  val out = mutableListOf<String>()
+                  out.add("Paquete en pantalla: ${root.packageName}")
+                  walk(root, out)
+                  if (out.size == 1) {
+                      out.add("No se encontraron botones ni textos. Si es un juego grafico (Unity, etc.), usa toques por coordenadas.")
+                  }
+                  return out
+              }
+
+              private fun walk(node: AccessibilityNodeInfo, out: MutableList<String>) {
+                  if (out.size > 300) return
+                  val text = node.text?.toString() ?: ""
+                  val desc = node.contentDescription?.toString() ?: ""
+                  val id = node.viewIdResourceName ?: ""
+                  if (text.isNotBlank() || desc.isNotBlank() || node.isClickable) {
+                      val r = Rect()
+                      node.getBoundsInScreen(r)
+                      val kind = if (node.isClickable) "[BOTON]" else "[TEXTO]"
+                      out.add("$kind text=$text desc=$desc id=$id centro=${r.centerX()},${r.centerY()}")
+                  }
+                  for (i in 0 until node.childCount) {
+                      val child = node.getChild(i) ?: continue
+                      walk(child, out)
+                  }
+              }
+
+              // ---------- Toques automaticos ----------
+
+              fun tap(x: Float, y: Float) {
+                  val path = Path()
+                  path.moveTo(x, y)
+                  val stroke = GestureDescription.StrokeDescription(path, 0L, 50L)
+                  val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                  dispatchGesture(gesture, null, null)
+              }
+
+              fun startTapping(x: Float, y: Float, intervalMs: Long, maxTaps: Int, startDelayMs: Long) {
+                  stopTapping()
+                  tapsDone = 0
+                  val runnable = object : Runnable {
+                      override fun run() {
+                          if (tapsDone >= maxTaps) {
+                              tapRunnable = null
+                              return
+                          }
+                          tap(x, y)
+                          tapsDone += 1
+                          handler.postDelayed(this, intervalMs)
+                      }
+                  }
+                  tapRunnable = runnable
+                  handler.postDelayed(runnable, startDelayMs)
+              }
+
+              fun stopTapping() {
+                  tapRunnable?.let { handler.removeCallbacks(it) }
+                  tapRunnable = null
+              }
+
+              fun isTapping(): Boolean = tapRunnable != null
+
               override fun onInterrupt() {
-                  Log.i(TAG, "Servicio interrumpido")
+                  stopTapping()
               }
 
               override fun onDestroy() {
+                  stopTapping()
                   instance = null
                   super.onDestroy()
               }
@@ -190,6 +273,15 @@ jobs:
 
                   @Volatile
                   var instance: GamePlayAccessibilityService? = null
+
+                  @Volatile
+                  var targetPackage: String = ""
+
+                  @Volatile
+                  var tapsDone: Int = 0
+
+                  @Volatile
+                  var scanResult: List<String> = emptyList()
 
                   val events = ConcurrentLinkedDeque<String>()
               }
@@ -204,61 +296,145 @@ jobs:
           import android.graphics.Typeface
           import android.os.Bundle
           import android.provider.Settings
+          import android.text.InputType
           import android.widget.Button
+          import android.widget.EditText
           import android.widget.LinearLayout
           import android.widget.ScrollView
           import android.widget.TextView
+          import android.widget.Toast
 
           class MainActivity : Activity() {
 
               private lateinit var status: TextView
               private lateinit var log: TextView
+              private lateinit var pkgField: EditText
+              private lateinit var xField: EditText
+              private lateinit var yField: EditText
+              private lateinit var intervalField: EditText
+              private lateinit var maxField: EditText
+              private var showScan = false
+
+              private fun input(hintText: String, value: String, number: Boolean): EditText {
+                  val e = EditText(this)
+                  e.hint = hintText
+                  e.setText(value)
+                  if (number) e.inputType = InputType.TYPE_CLASS_NUMBER
+                  e.setSingleLine()
+                  return e
+              }
+
+              private fun button(label: String, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = label
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
+              private fun label(text: String): TextView {
+                  val t = TextView(this)
+                  t.text = text
+                  t.textSize = 14f
+                  t.setPadding(0, 24, 0, 0)
+                  t.setTypeface(t.typeface, Typeface.BOLD)
+                  return t
+              }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
 
                   val pad = (16 * resources.displayMetrics.density).toInt()
-                  val root = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      setPadding(pad, pad, pad, pad)
-                  }
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(pad, pad, pad, pad)
 
-                  val title = TextView(this).apply {
-                      text = "GAME PLAY AI JR - BETA"
-                      textSize = 20f
-                      setTypeface(typeface, Typeface.BOLD)
-                  }
-                  status = TextView(this).apply { textSize = 16f; setPadding(0, pad, 0, pad) }
+                  val title = TextView(this)
+                  title.text = "GAME PLAY AI JR - BETA"
+                  title.textSize = 20f
+                  title.setTypeface(title.typeface, Typeface.BOLD)
 
-                  val openSettings = Button(this).apply {
-                      text = "Activar accesibilidad"
-                      setOnClickListener {
-                          startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                      }
-                  }
-                  val refresh = Button(this).apply {
-                      text = "Actualizar eventos"
-                      setOnClickListener { render() }
-                  }
-                  val stop = Button(this).apply {
-                      text = "PARAR servicio"
-                      setOnClickListener {
-                          GamePlayAccessibilityService.instance?.disableSelf()
-                          GamePlayAccessibilityService.events.clear()
-                          render()
-                      }
-                  }
+                  status = TextView(this)
+                  status.textSize = 16f
+                  status.setPadding(0, pad / 2, 0, pad / 2)
 
-                  log = TextView(this).apply { textSize = 12f }
-                  val scroll = ScrollView(this).apply { addView(log) }
+                  pkgField = input("Paquete del juego (ej: com.juego.app)", "", false)
+                  xField = input("X", "540", true)
+                  yField = input("Y", "1200", true)
+                  intervalField = input("Intervalo ms (min 100)", "1000", true)
+                  maxField = input("Max toques (1-5000)", "50", true)
 
                   root.addView(title)
                   root.addView(status)
-                  root.addView(openSettings)
-                  root.addView(refresh)
-                  root.addView(stop)
-                  root.addView(scroll)
-                  setContentView(root)
+                  root.addView(button("1. Activar accesibilidad") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+
+                  root.addView(label("2. FILTRAR UN JUEGO"))
+                  root.addView(pkgField)
+                  root.addView(button("Guardar filtro (vacio = todos)") {
+                      GamePlayAccessibilityService.targetPackage = pkgField.text.toString().trim()
+                      GamePlayAccessibilityService.events.clear()
+                      showScan = false
+                      render()
+                  })
+                  root.addView(button("Escanear pantalla en 5 s") {
+                      val s = GamePlayAccessibilityService.instance
+                      if (s == null) {
+                          Toast.makeText(this, "Activa el servicio primero", Toast.LENGTH_SHORT).show()
+                      } else {
+                          s.scanLater(5000L)
+                          showScan = true
+                          render()
+                          Toast.makeText(this, "Cambia al juego. Vuelve aqui en 6 s y pulsa Actualizar", Toast.LENGTH_LONG).show()
+                      }
+                  })
+
+                  root.addView(label("3. TOQUES AUTOMATICOS"))
+                  root.addView(xField)
+                  root.addView(yField)
+                  root.addView(intervalField)
+                  root.addView(maxField)
+                  root.addView(button("Iniciar toques en 5 s") {
+                      val s = GamePlayAccessibilityService.instance
+                      val x = xField.text.toString().toFloatOrNull()
+                      val y = yField.text.toString().toFloatOrNull()
+                      val interval = (intervalField.text.toString().toLongOrNull() ?: 1000L).coerceAtLeast(100L)
+                      val max = (maxField.text.toString().toIntOrNull() ?: 50).coerceIn(1, 5000)
+                      if (s == null) {
+                          Toast.makeText(this, "Activa el servicio primero", Toast.LENGTH_SHORT).show()
+                      } else if (x == null || y == null) {
+                          Toast.makeText(this, "X e Y no validos", Toast.LENGTH_SHORT).show()
+                      } else {
+                          s.startTapping(x, y, interval, max, 5000L)
+                          Toast.makeText(this, "Cambia al juego, empieza en 5 s", Toast.LENGTH_LONG).show()
+                          render()
+                      }
+                  })
+                  root.addView(button("PARAR toques") {
+                      GamePlayAccessibilityService.instance?.stopTapping()
+                      render()
+                  })
+
+                  root.addView(label("4. RESULTADOS"))
+                  root.addView(button("Actualizar") { render() })
+                  root.addView(button("Ver eventos") { showScan = false; render() })
+                  root.addView(button("Ver ultimo escaneo") { showScan = true; render() })
+                  root.addView(button("PARAR servicio") {
+                      val s = GamePlayAccessibilityService.instance
+                      s?.stopTapping()
+                      s?.disableSelf()
+                      GamePlayAccessibilityService.events.clear()
+                      render()
+                  })
+
+                  log = TextView(this)
+                  log.textSize = 12f
+                  log.setPadding(0, pad / 2, 0, 0)
+                  root.addView(log)
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(root)
+                  setContentView(scroll)
               }
 
               override fun onResume() {
@@ -267,49 +443,19 @@ jobs:
               }
 
               private fun render() {
-                  val active = GamePlayAccessibilityService.instance != null
-                  status.text = if (active) "Servicio: ACTIVO" else "Servicio: INACTIVO"
-                  log.text = GamePlayAccessibilityService.events.joinToString("\n\n")
-              }
-          }
-          EOF_FILE
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-
-      - name: Aceptar licencias del SDK
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.7
-
-      - name: Build debug APK
-        run: gradle assembleDebug --stacktrace
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: GamePlayAIJR-debug-apk
-          path: app/build/outputs/apk/debug/*.apk)
-                  root.addView(status)
-                  root.addView(openSettings)
-                  root.addView(refresh)
-                  root.addView(stop)
-                  root.addView(scroll)
-                  setContentView(root)
-              }
-
-              override fun onResume() {
-                  super.onResume()
-                  render()
-              }
-
-              private fun render() {
-                  val active = GamePlayAccessibilityService.instance != null
-                  status.text = if (active) "Servicio: ACTIVO" else "Servicio: INACTIVO"
-                  log.text = GamePlayAccessibilityService.events.joinToString("\n\n")
+                  val s = GamePlayAccessibilityService.instance
+                  val active = s != null
+                  val tapping = s?.isTapping() == true
+                  val filter = GamePlayAccessibilityService.targetPackage
+                  status.text = (if (active) "Servicio: ACTIVO" else "Servicio: INACTIVO") +
+                      "\nFiltro: " + (if (filter.isEmpty()) "todos" else filter) +
+                      "\nToques: " + (if (tapping) "EN CURSO" else "parado") +
+                      " (" + GamePlayAccessibilityService.tapsDone + ")"
+                  log.text = if (showScan) {
+                      GamePlayAccessibilityService.scanResult.joinToString("\n\n")
+                  } else {
+                      GamePlayAccessibilityService.events.joinToString("\n\n")
+                  }
               }
           }
           EOF_FILE
